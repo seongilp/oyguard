@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.oyguard-work/
+.pytest_cache/
+*.egg-info/
+
+# Node / Next
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+
+# Env
+.env
+.env.local
+.env*.local
+
+# cosign keys (never commit private keys)
+cosign.key
+cosign.pub
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.omc/
+.gstack/

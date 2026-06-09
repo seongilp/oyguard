@@ -1,0 +1,115 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+  oy-guard — Toss-style light theme.
+  Clean white surfaces, soft off-white page background, blue (#3182f6) primary accent.
+  Light mode only: no .dark variant is defined and no prefers-color-scheme override.
+*/
+
+:root {
+  --radius: 1rem;
+
+  /* Surfaces */
+  --background: #f9fafb; /* soft off-white page */
+  --foreground: #191f28; /* Toss near-black ink */
+
+  --card: #ffffff;
+  --card-foreground: #191f28;
+
+  --popover: #ffffff;
+  --popover-foreground: #191f28;
+
+  /* Primary = Toss blue */
+  --primary: #3182f6;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f2f4f6;
+  --secondary-foreground: #333d4b;
+
+  --muted: #f2f4f6;
+  --muted-foreground: #8b95a1;
+
+  --accent: #e8f3ff;
+  --accent-foreground: #1b64da;
+
+  --destructive: #f04452;
+  --destructive-foreground: #ffffff;
+
+  --border: #e5e8eb;
+  --input: #e5e8eb;
+  --ring: #3182f6;
+
+  /* Charts (optional) */
+  --chart-1: #3182f6;
+  --chart-2: #00c2ad;
+  --chart-3: #f5a623;
+  --chart-4: #f04452;
+  --chart-5: #845ef7;
+
+  /* Sidebar tokens (shadcn defaults) */
+  --sidebar: #ffffff;
+  --sidebar-foreground: #191f28;
+  --sidebar-primary: #3182f6;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f2f4f6;
+  --sidebar-accent-foreground: #333d4b;
+  --sidebar-border: #e5e8eb;
+  --sidebar-ring: #3182f6;
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --font-sans: var(--font-pretendard), "Pretendard", system-ui, -apple-system,
+    "Segoe UI", Roboto, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
+    monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}

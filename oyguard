@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# oyguard CLI — runs the same services as the web backend.
+# Usage: ./oyguard scan nginx:latest
+#        ./oyguard fix nginx:latest --strategy copa --push ghcr.io/me/nginx:secure
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT/backend"
+exec uv run --quiet python -m app.cli "$@"

@@ -1,0 +1,325 @@
+"""Image remediation that actually fixes vulnerabilities.
+
+The honest way to remediate a container from just its registry reference is to
+**keep the original image and patch its OS packages in place** — never to throw
+the application away. Two strategies:
+
+* ``in-place`` (default) — derive a Dockerfile ``FROM`` the original image and
+  upgrade the vulnerable packages with the image's own package manager
+  (apt/apk/dnf, chosen from the detected OS family). The application and all its
+  layers are preserved; only the vulnerable OS packages move to fixed versions.
+* ``copa`` — use Copacetic (https://github.com/project-copacetic/copacetic) to
+  binary-patch the image directly from the scan report. This is the purpose-built
+  tool (works even on distroless images) and is used automatically when the
+  ``copa`` binary is available.
+
+After patching, the new image is re-scanned so the reported "fixed" and
+"remaining" counts reflect reality, not an emptied-out base image.
+"""
+from __future__ import annotations
+
+import os
+
+from ..core import shell
+from ..core.config import get_settings
+from ..models import RemediationResult, ScanResult, ScanSummary, Vulnerability
+from . import scanner
+
+# Map an OS family (as reported by Trivy/Grype) to its package manager.
+_APT = {"debian", "ubuntu"}
+_APK = {"alpine", "wolfi", "chainguard"}
+_DNF = {
+    "redhat", "rhel", "centos", "rocky", "rockylinux", "almalinux", "alma",
+    "amazon", "amzn", "fedora", "oracle", "ol",
+}
+
+
+def remediated_tag(image: str) -> str:
+    """Append the remediation suffix to an image reference's tag."""
+    suffix = get_settings().remediated_suffix
+    ref = image.split("@", 1)[0]
+    if ":" in ref.rsplit("/", 1)[-1]:
+        base, tag = ref.rsplit(":", 1)
+        return f"{base}:{tag}-{suffix}"
+    return f"{ref}:{suffix}"
+
+
+def package_manager(os_family: str) -> str:
+    f = (os_family or "").lower()
+    if f in _APT:
+        return "apt"
+    if f in _APK:
+        return "apk"
+    if f in _DNF:
+        return "dnf"
+    return ""
+
+
+def _fixable_packages(scan: ScanResult) -> list[str]:
+    # Only packages that have a known fixed version are worth upgrading.
+    pkgs = {v.package for v in scan.vulnerabilities if v.package and v.fixed_version}
+    if not pkgs:
+        pkgs = {v.package for v in scan.vulnerabilities if v.package}
+    return sorted(pkgs)
+
+
+def _upgrade_command(pm: str, pkgs: list[str]) -> str:
+    joined = " ".join(pkgs)
+    if pm == "apt":
+        if pkgs:
+            return (
+                "RUN apt-get update && "
+                "apt-get install -y --no-install-recommends --only-upgrade "
+                f"{joined} && rm -rf /var/lib/apt/lists/*"
+            )
+        return "RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*"
+    if pm == "apk":
+        return f"RUN apk update && apk upgrade --no-cache {joined}".rstrip()
+    if pm == "dnf":
+        if pkgs:
+            return f"RUN (dnf -y upgrade {joined} || yum -y upgrade {joined}) && (dnf clean all || yum clean all || true)"
+        return "RUN (dnf -y upgrade || yum -y upgrade) && (dnf clean all || yum clean all || true)"
+    # Unknown distro: best-effort, try each manager.
+    return (
+        "RUN (command -v apk >/dev/null && apk update && apk upgrade --no-cache) || "
+        "(command -v apt-get >/dev/null && apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*) || "
+        "(command -v dnf >/dev/null && dnf -y upgrade) || "
+        "(command -v yum >/dev/null && yum -y upgrade) || "
+        "(echo 'oy-guard: no supported package manager found' && false)"
+    )
+
+
+async def _original_user(image: str) -> str:
+    settings = get_settings()
+    res = await shell.run(
+        [settings.docker_bin, "image", "inspect", "--format", "{{.Config.User}}", image],
+        timeout=60,
+    )
+    return res.stdout.strip() if res.ok else ""
+
+
+async def _docker_platform() -> str:
+    """Host platform (e.g. ``linux/arm64``) so copa can resolve multi-arch images."""
+    settings = get_settings()
+    res = await shell.run(
+        [settings.docker_bin, "version", "-f", "{{.Server.Arch}}"], timeout=30
+    )
+    arch = res.stdout.strip() if res.ok else ""
+    return f"linux/{arch}" if arch else ""
+
+
+async def _image_exists(image: str) -> bool:
+    """True if the image is present in the local docker daemon."""
+    settings = get_settings()
+    res = await shell.run(
+        [settings.docker_bin, "image", "inspect", image], timeout=60
+    )
+    return res.ok
+
+
+def build_inplace_dockerfile(image: str, scan: ScanResult, original_user: str = "") -> str:
+    pm = package_manager(scan.os_family)
+    pkgs = _fixable_packages(scan)
+    upgrade = _upgrade_command(pm, pkgs)
+    # Patch as root, then restore the image's original runtime user so we don't
+    # silently escalate the container's privileges.
+    restore_user = f"USER {original_user}\n" if original_user else ""
+    return (
+        f"# Generated by oy-guard — in-place patch ({scan.os_family or 'unknown'} / {pm or 'auto'})\n"
+        f"# Keeps the original image and upgrades vulnerable OS packages to fixed versions.\n"
+        f"FROM {image}\n"
+        f"USER root\n"
+        f"{upgrade}\n"
+        f"{restore_user}"
+    )
+
+
+async def _build(dockerfile: str, new_image: str) -> None:
+    settings = get_settings()
+    work = os.path.join(settings.work_dir, "build")
+    os.makedirs(work, exist_ok=True)
+    dockerfile_path = os.path.join(work, "Dockerfile")
+    with open(dockerfile_path, "w") as fh:
+        fh.write(dockerfile)
+    if not shell.tool_available(settings.docker_bin):
+        raise RuntimeError("docker가 설치되어 있지 않습니다.")
+    build = await shell.run(
+        [settings.docker_bin, "build", "-t", new_image, "-f", dockerfile_path, work],
+        timeout=settings.command_timeout,
+    )
+    if not build.ok:
+        raise RuntimeError(f"docker build failed: {build.stderr[-1200:]}")
+
+
+async def _rescan_summary(new_image: str) -> tuple[ScanSummary, bool]:
+    """Re-scan the patched image. Returns (summary, ok).
+
+    ``ok`` is False if the scan could not run — callers MUST NOT interpret an
+    empty summary as "0 remaining", because that would falsely report the image
+    as fully remediated.
+    """
+    try:
+        return (await scanner.scan_image(new_image)).summary, True
+    except Exception:  # noqa: BLE001
+        return ScanSummary(), False
+
+
+def _build_result(
+    new_image: str,
+    base_image: str,
+    label: str,
+    original: ScanResult,
+    remaining: ScanSummary,
+    rescan_ok: bool,
+    dockerfile: str,
+) -> RemediationResult:
+    """Assemble a RemediationResult, reporting honestly when re-scan failed.
+
+    On re-scan failure we keep the ORIGINAL counts as `remaining` and report
+    `fixed_count=0` — never a fabricated reduction.
+    """
+    if rescan_ok:
+        return RemediationResult(
+            new_image=new_image,
+            base_image=base_image,
+            strategy=label,
+            remaining=remaining,
+            fixed_count=max(original.summary.total - remaining.total, 0),
+            dockerfile=dockerfile,
+            rescan_ok=True,
+        )
+    return RemediationResult(
+        new_image=new_image,
+        base_image=base_image,
+        strategy=label,
+        remaining=original.summary,
+        fixed_count=0,
+        dockerfile=dockerfile,
+        rescan_ok=False,
+    )
+
+
+async def remediate(image: str, scan: ScanResult, strategy: str) -> RemediationResult:
+    settings = get_settings()
+    new_image = remediated_tag(image)
+
+    if settings.demo_mode:
+        return _demo_remediation(image, scan, new_image, strategy)
+
+    # Prefer Copacetic (purpose-built, works on distroless, no Dockerfile) unless
+    # the caller explicitly asked for in-place. If copa fails for any reason
+    # (e.g. an unusual image), fall back to in-place so the user still gets a
+    # patched image instead of a hard failure.
+    copa_note = ""
+    if strategy in {"copa", "copa-all"} and shell.tool_available("copa"):
+        try:
+            return await _copa_remediate(
+                image, scan, new_image, comprehensive=(strategy == "copa-all")
+            )
+        except Exception as exc:  # noqa: BLE001
+            copa_note = (
+                f"# oy-guard: copa 패치 실패로 in-place 방식으로 폴백했습니다.\n"
+                f"# 원인: {str(exc)[:300]}\n"
+            )
+
+    # In-place package upgrade on the original image (explicit, or copa fallback).
+    original_user = await _original_user(image)
+    dockerfile = build_inplace_dockerfile(image, scan, original_user)
+    await _build(dockerfile, new_image)
+    if not await _image_exists(new_image):
+        raise RuntimeError(f"이미지 빌드 후에도 {new_image}가 존재하지 않습니다.")
+    remaining, rescan_ok = await _rescan_summary(new_image)
+    return _build_result(
+        new_image, image, "in-place", scan, remaining, rescan_ok, copa_note + dockerfile
+    )
+
+
+async def _copa_remediate(
+    image: str, scan: ScanResult, new_image: str, comprehensive: bool = False
+) -> RemediationResult:
+    """Patch the image with Copacetic.
+
+    Targeted mode (default) patches only the vulnerabilities in a fresh Trivy
+    report. Comprehensive mode (``copa-all``) upgrades *every* OS package to the
+    latest available version — catching more than the report lists.
+    """
+    settings = get_settings()
+    tag = new_image.rsplit(":", 1)[-1]
+    # Pin a single platform so multi-arch manifest-list images (nginx, etc.)
+    # resolve to one image config instead of failing with "object required".
+    platform = await _docker_platform()
+
+    cmd = ["copa", "patch", "-i", image, "-t", tag]
+    command_str = f"copa patch -i {image} -t {tag}"
+    if not comprehensive:
+        work = os.path.join(settings.work_dir, "copa")
+        os.makedirs(work, exist_ok=True)
+        report = os.path.join(work, "report.json")
+        rep = await shell.run(
+            [settings.trivy_bin, "image", "--quiet", "--format", "json",
+             "--ignore-unfixed", "--vuln-type", "os", "-o", report, image],
+            timeout=settings.command_timeout,
+        )
+        if not rep.ok:
+            raise RuntimeError(f"copa용 trivy 리포트 생성 실패: {rep.stderr[-300:]}")
+        cmd += ["-r", report]
+        command_str += " -r report.json"
+    if platform:
+        cmd += ["--platform", platform]
+        command_str += f" --platform {platform}"
+
+    res = await shell.run(cmd, timeout=settings.command_timeout)
+    if not res.ok:
+        raise RuntimeError(f"copa patch 실패: {res.stderr[-600:]}")
+
+    # Depending on mode/image, copa emits either the clean tag (`repo:tag`) or a
+    # per-arch tag (`repo:tag-<arch>`). Normalize to the clean name and then
+    # VERIFY it exists — never declare success on a phantom image.
+    if not await _image_exists(new_image):
+        arch = platform.rsplit("/", 1)[-1] if platform else ""
+        produced = f"{new_image}-{arch}" if arch else ""
+        if produced and await _image_exists(produced):
+            tagged = await shell.run(
+                [settings.docker_bin, "tag", produced, new_image], timeout=60
+            )
+            if not tagged.ok:
+                raise RuntimeError(f"docker tag 실패: {tagged.stderr[-300:]}")
+        if not await _image_exists(new_image):
+            raise RuntimeError(
+                f"copa가 이미지를 생성하지 못했습니다 ({new_image} 없음). "
+                f"copa 출력: {res.stdout[-300:]}"
+            )
+
+    remaining, rescan_ok = await _rescan_summary(new_image)
+    label = "copa-all" if comprehensive else "copa"
+    kind = "전체 OS 패키지 업데이트" if comprehensive else "리포트 기반 패치"
+    return _build_result(
+        new_image, image, label, scan, remaining, rescan_ok,
+        f"# Copacetic {kind} (Dockerfile 없음)\n# {command_str}\n",
+    )
+
+
+def _demo_remediation(
+    image: str, scan: ScanResult, new_image: str, strategy: str
+) -> RemediationResult:
+    # Simulate a realistic in-place patch: most fixable vulns get patched, but
+    # anything without an available fix remains. Honest-ish for UI testing.
+    fixable = {(v.id, v.package) for v in scan.vulnerabilities if v.fixed_version}
+    remaining_vulns = [
+        v for v in scan.vulnerabilities if (v.id, v.package) not in fixable
+    ]
+    remaining = ScanSummary.from_vulns(remaining_vulns)
+    label = strategy if strategy in {"copa", "copa-all", "in-place"} else "copa"
+    dockerfile = (
+        build_inplace_dockerfile(image, scan)
+        if label == "in-place"
+        else f"# Copacetic {'전체 OS 업데이트' if label == 'copa-all' else '패치'} (demo)\n"
+    )
+    return RemediationResult(
+        new_image=new_image,
+        base_image=image,
+        strategy=label,
+        remaining=remaining,
+        fixed_count=max(scan.summary.total - remaining.total, 0),
+        dockerfile=dockerfile,
+    )
